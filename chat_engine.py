@@ -87,32 +87,72 @@ class ChatEngine:
         self.audit = audit
         self.history: list[dict] = []
 
-    def _fetch_and_log(self, url: str) -> str:
-        """Fetch a URL, audit-log the result, and return formatted content."""
+    # How many search-result URLs to attempt before giving up.
+    AUTO_FETCH_TRIES = 3
+
+    def _fetch_and_log(self, url: str) -> tuple[str, bool]:
+        """Fetch a URL, audit-log the result, and return ``(content, ok)``.
+
+        The boolean second element is ``True`` when the fetch produced usable
+        page text and ``False`` when it failed for any reason (network error,
+        non-text content-type, empty body, etc.).
+        """
         try:
             content = self.fetcher.fetch_formatted(url)
-            is_error = "Error fetching URL:" in content
+            is_error = "Error fetching URL:" in content or "Non-text content type" in content
             if self.audit:
                 if is_error:
                     self.audit.log("web_fetch", url, "error", "fetch failed")
                 else:
                     self.audit.log("web_fetch", url, "ok", f"{len(content)} chars returned")
+            return content, not is_error
         except Exception as exc:
             content = f"Fetch error: {exc}"
             if self.audit:
                 self.audit.log("web_fetch", url, "error", str(exc))
-        return content
+            return content, False
 
-    def _handle_tool_call(self, generated: str) -> str | None:
-        """Check *generated* text for a tool marker and return injected results, or None."""
-        search_match = _SEARCH_RE.search(generated)
-        if search_match and self.brave:
+    def _auto_fetch_best(self, results: list[dict]) -> str:
+        """Try fetching up to ``AUTO_FETCH_TRIES`` URLs from *results*.
+
+        Returns the formatted ``[FETCH_RESULT]`` block for the first URL that
+        succeeds, or an error summary if every attempt fails.
+        """
+        errors: list[str] = []
+        for rank, r in enumerate(results[: self.AUTO_FETCH_TRIES], 1):
+            url = r["url"]
+            content, ok = self._fetch_and_log(url)
+            if ok:
+                header = f"(Auto-fetched result #{rank}: {url})"
+                return f"[FETCH_RESULT]\n{header}\n{content}\n[/FETCH_RESULT]\n\n"
+            errors.append(f"  #{rank} {url} — failed")
+
+        error_list = "\n".join(errors)
+        return (
+            f"[FETCH_RESULT]\n"
+            f"Auto-fetch failed for the top {len(errors)} results:\n{error_list}\n"
+            f"You may try [FETCH: <url>] with a different URL from the search results above.\n"
+            f"[/FETCH_RESULT]\n\n"
+        )
+
+    def _handle_tool_calls(self, generated: str) -> str | None:
+        """Scan *generated* for tool markers and return all injected results.
+
+        Unlike the previous single-match approach, this finds **all** tool
+        markers in the chunk (e.g. a SEARCH followed by a FETCH) and
+        processes each one.
+        """
+        injections: list[str] = []
+
+        # --- Process every SEARCH marker ------------------------------------
+        for search_match in _SEARCH_RE.finditer(generated):
+            if not self.brave:
+                continue
             query = search_match.group(1).strip()
             try:
                 raw_results = self.brave.search(query)
 
                 if raw_results:
-                    # Build formatted listing from the same results.
                     lines: list[str] = []
                     for i, r in enumerate(raw_results, 1):
                         lines.append(f"{i}. {r['title']}")
@@ -133,23 +173,22 @@ class ChatEngine:
                 if self.audit:
                     self.audit.log("brave_search", query, "error", str(exc))
 
-            injection = f"\n\n[SEARCH_RESULTS]\n{formatted}\n[/SEARCH_RESULTS]\n\n"
+            injections.append(f"\n\n[SEARCH_RESULTS]\n{formatted}\n[/SEARCH_RESULTS]\n\n")
 
-            # Auto-fetch the top search result so the model has full page
-            # content immediately, without needing a separate FETCH round.
+            # Auto-fetch with fallback across top results.
             if raw_results and self.fetcher:
-                top_url = raw_results[0]["url"]
-                page_content = self._fetch_and_log(top_url)
-                injection += f"[FETCH_RESULT]\n{page_content}\n[/FETCH_RESULT]\n\n"
+                injections.append(self._auto_fetch_best(raw_results))
 
-            return injection
-
-        fetch_match = _FETCH_RE.search(generated)
-        if fetch_match and self.fetcher:
+        # --- Process every FETCH marker (only those NOT already auto-fetched)
+        for fetch_match in _FETCH_RE.finditer(generated):
+            if not self.fetcher:
+                continue
             url = fetch_match.group(1).strip()
-            content = self._fetch_and_log(url)
-            return f"\n\n[FETCH_RESULT]\n{content}\n[/FETCH_RESULT]\n\n"
+            content, _ = self._fetch_and_log(url)
+            injections.append(f"\n\n[FETCH_RESULT]\n{content}\n[/FETCH_RESULT]\n\n")
 
+        if injections:
+            return "".join(injections)
         return None
 
     def chat(self, user_message: str) -> str:
@@ -171,7 +210,7 @@ class ChatEngine:
             )
             full_reply += generated
 
-            injection = self._handle_tool_call(generated)
+            injection = self._handle_tool_calls(generated)
             if injection:
                 full_reply += injection
             else:
