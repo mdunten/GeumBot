@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from kobold_client import KoboldClient
 from brave_search import BraveSearchClient
+from web_fetcher import WebFetcher
 from chat_engine import ChatEngine
 
 
@@ -57,8 +58,12 @@ def main() -> None:
     else:
         print("WARNING: No BRAVE_SEARCH_API_KEY set — web search is disabled.")
 
+    # --- Web Fetcher --------------------------------------------------------
+    fetcher = WebFetcher()
+    print("Web fetch enabled.")
+
     # --- Chat loop ----------------------------------------------------------
-    engine = ChatEngine(kobold, brave)
+    engine = ChatEngine(kobold, brave, fetcher)
     print("\nGeumBot ready. Type your message (or /quit to exit, /reset to clear history).\n")
 
     while True:
