@@ -14,6 +14,7 @@ import re
 from kobold_client import KoboldClient
 from brave_search import BraveSearchClient
 from web_fetcher import WebFetcher
+from audit_log import AuditLogger
 
 # The markers the model should emit when it wants to use a tool.
 _SEARCH_RE = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
@@ -69,10 +70,12 @@ class ChatEngine:
         kobold: KoboldClient,
         brave: BraveSearchClient | None = None,
         fetcher: WebFetcher | None = None,
+        audit: AuditLogger | None = None,
     ):
         self.kobold = kobold
         self.brave = brave
         self.fetcher = fetcher
+        self.audit = audit
         self.history: list[dict] = []
 
     def _handle_tool_call(self, generated: str) -> str | None:
@@ -80,13 +83,33 @@ class ChatEngine:
         search_match = _SEARCH_RE.search(generated)
         if search_match and self.brave:
             query = search_match.group(1).strip()
-            results = self.brave.search_formatted(query)
+            try:
+                results = self.brave.search_formatted(query)
+                if self.audit:
+                    hit_count = results.count("\n   URL: ") if results != "No search results found." else 0
+                    self.audit.log("brave_search", query, "ok", f"{hit_count} results")
+            except Exception as exc:
+                results = f"Search error: {exc}"
+                if self.audit:
+                    self.audit.log("brave_search", query, "error", str(exc))
             return f"\n\n[SEARCH_RESULTS]\n{results}\n[/SEARCH_RESULTS]\n\n"
 
         fetch_match = _FETCH_RE.search(generated)
         if fetch_match and self.fetcher:
             url = fetch_match.group(1).strip()
-            content = self.fetcher.fetch_formatted(url)
+            try:
+                content = self.fetcher.fetch_formatted(url)
+                is_error = content.startswith("URL:") and "Error fetching URL:" in content
+                if self.audit:
+                    if is_error:
+                        self.audit.log("web_fetch", url, "error", "fetch failed")
+                    else:
+                        char_count = len(content)
+                        self.audit.log("web_fetch", url, "ok", f"{char_count} chars returned")
+            except Exception as exc:
+                content = f"Fetch error: {exc}"
+                if self.audit:
+                    self.audit.log("web_fetch", url, "error", str(exc))
             return f"\n\n[FETCH_RESULT]\n{content}\n[/FETCH_RESULT]\n\n"
 
         return None

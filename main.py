@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from kobold_client import KoboldClient
 from brave_search import BraveSearchClient
 from web_fetcher import WebFetcher
+from audit_log import AuditLogger
 from chat_engine import ChatEngine
 
 
@@ -62,8 +63,12 @@ def main() -> None:
     fetcher = WebFetcher()
     print("Web fetch enabled.")
 
+    # --- Audit Log ----------------------------------------------------------
+    audit = AuditLogger()
+    print(f"Audit logging to {audit._path.resolve()}")
+
     # --- Chat loop ----------------------------------------------------------
-    engine = ChatEngine(kobold, brave, fetcher)
+    engine = ChatEngine(kobold, brave, fetcher, audit)
     print("\nGeumBot ready. Type your message (or /quit to exit, /reset to clear history).\n")
 
     while True:
